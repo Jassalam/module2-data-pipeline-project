@@ -119,3 +119,42 @@ See [solution/README.md](solution/README.md) for how to run it and how its files
 1. What are the steps you took to complete the project?
 2. What challenges did you face?
 3. What would you do differently if you had more time?
+
+### 1. What are the steps you took to complete the project?
+
+I followed the four steps in [project.md](project.md), which also has a detailed "Working" section for each point.
+
+1. **Extract: download the data.** I wrote [scripts/download_data.py](scripts/download_data.py), which builds the download link for each month (Jan–Mar 2025) and saves the Parquet files to `data/raw/`. Files that are already there are skipped, so running it again is quick. Each download goes to a temporary `.part` file first, so a failed download never leaves a broken file behind.
+2. **Explore the data.** In [notebooks/explore.ipynb](notebooks/explore.ipynb) I loaded the data, picked the columns I needed (`lpep_pickup_datetime` for the day, `total_amount` for revenue), and checked data types, missing values and value ranges. I found 11 trips outside Q1 2025, 478 negative amounts (mostly "No charge" and "Dispute" trips) and 254 zero amounts. From that I decided on the cleaning rules.
+3. **Transform and load: build the pipeline.** I chose **ETL**: the data is small (146k rows), there is no database, and pandas is enough. I split the code into one module per stage in [src/taxi_pipeline/](src/taxi_pipeline/) (`extract.py`, `transform.py`, `load.py`), plus a shared `config.py`. The pipeline drops the out-of-period and non-positive trips, prints the row count after each rule (146,486 → 145,743, 99.5% kept), groups by pickup day, and writes `data/processed/daily_revenue.csv` and `.parquet`. The result is 90 days and **$3,401,753.17** total revenue. I added tests in [tests/test_taxi_transform.py](tests/test_taxi_transform.py) for the cleaning rules and daily totals.
+4. **Orchestrate with Prefect (bonus).** In [src/taxi_pipeline/flow.py](src/taxi_pipeline/flow.py) each stage is a Prefect task, and the whole run is one flow. Only the download task has retries (3 retries, after 5, 15 and 30 s), because it is the only step that uses the network. I tested the retries by requesting a month that doesn't exist.
+5. **Present the result.** I summarised the result in an 8-slide deck, [docs/green_taxi_daily_revenue.pdf](docs/green_taxi_daily_revenue.pdf), with charts of revenue per day, by weekday and by month, and the best and worst days.
+
+**How to run it:**
+
+```bash
+uv sync
+uv run scripts/download_data.py      # stage the raw files
+uv run scripts/run_pipeline.py       # plain ETL pipeline
+uv run scripts/run_prefect_flow.py   # same pipeline as a Prefect flow
+uv run pytest                        # tests
+```
+
+### 2. What challenges did you face?
+
+- **Dirty data.** The files are split by month, but some trips in them were picked up outside that month, a few even outside Q1 2025 (from 2024-12-25 to 2025-04-01). Without a date filter, these would have added stray days to the result. There were also negative and zero amounts, which I had to understand before deciding to drop them.
+- **Deciding what "revenue" means.** `total_amount` (everything the passenger paid) and `fare_amount` (only the metered fare) give different answers. I chose `total_amount` and documented why.
+- **Refunds and reversals.** The smallest amount (−$473.10) exactly cancels out the largest March trip ($473.10), so negative rows seem to reverse earlier charges. Dropping only the negative row means the original charge still counts as revenue. I kept the simple rule and documented it as a known limitation.
+- **Keeping the stages consistent.** At first the download was a single script with its own settings. When I added the pipeline, I moved the settings into a shared `config.py`, so the download and the pipeline always use the same file names and folders.
+- **Prefect setup.** My Prefect settings still pointed at a server from an earlier project that wasn't running, which caused connection errors and a stream of `EventsWorker failed` messages. The fix was to clear `PREFECT_API_URL` so Prefect starts its own temporary server. Running `prefect config set` afterwards wrote the old address back, so the `unset` command has to run last.
+- **Prefect caching and DataFrames.** By default, Prefect tries to cache task results by hashing the inputs. That doesn't suit tasks that pass whole DataFrames around, so I turned caching off for those tasks.
+
+### 3. What would you do differently if you had more time?
+
+- **Handle reversals properly.** Match each negative trip to the original charge it cancels and remove both, so revenue isn't overstated.
+- **Try ELT with DuckDB and dbt.** Load the raw Parquet files into DuckDB and do the cleaning and grouping in SQL models with dbt. That would scale better and let others query the raw trips.
+- **Add data validation.** Check the expected columns, types and value ranges automatically when reading the data (for example with pandera), instead of relying on the one-time notebook check.
+- **More tests.** Add tests for the extract and load stages and for the Prefect flow, and an end-to-end test on a small sample file.
+- **Make the pipeline configurable.** Let the months and paths be set from the command line, so the same code can process any period without editing `config.py`.
+- **Package the project properly.** Add a build system to `pyproject.toml` so `taxi_pipeline` installs into the environment, instead of adding `src/` to the import path in each script.
+- **Schedule it.** Deploy the Prefect flow with a monthly schedule so new data is downloaded and processed automatically.
